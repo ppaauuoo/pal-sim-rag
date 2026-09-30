@@ -1,23 +1,21 @@
 import lancedb
 import uvicorn
-from lancedb.embeddings import get_registry
+from chonkie import LanceDBHandshake
+from chonkie.pipeline import Pipeline
 from lancedb.pydantic import LanceModel, Vector
 from litestar import Litestar, get
 
+EMBEDDING_MODEL = "model2vec://mikeee/m2v-gemma-embedding-300m"
+
 db = lancedb.connect(".lancedb/")
-func = (
-    get_registry()
-    .get("ollama")
-    .create(name="embeddinggemma", host="http://localhost:11434")
+handshake = LanceDBHandshake(
+    connection=db, table_name="knowledge", embedding_model=EMBEDDING_MODEL
 )
 
 
 class Knowledge(LanceModel):
-    text: str = func.SourceField()
-    vector: Vector(func.ndims()) = func.VectorField()
-
-
-table = db.create_table("knowledge", schema=Knowledge, exist_ok=True)
+    text: str
+    vector: Vector(handshake.dimension)
 
 
 @get("/")
@@ -26,27 +24,46 @@ async def index() -> str:
 
 
 @get("/ingests")
-async def ingests(texts: list[Knowledge]) -> str:
-    table.add(texts)
-    return "Done"
+async def ingests() -> str:
+    # ponytail: Pipeline.run() returns None after a write step; count from the table
+    (
+        Pipeline()
+        .fetch_from("file", dir="./knowledge_base", ext=[".txt", ".md"])
+        .process_with("text")
+        .chunk_with("semantic", threshold=0.8, chunk_size=1024, similarity_window=3)
+        .refine_with("overlap", context_size=100)
+        .store_in(
+            "lancedb",
+            connection=db,
+            table_name="knowledge",
+            embedding_model=EMBEDDING_MODEL,
+        )
+        .run()
+    )
+    count = handshake.table.count_rows()
+    print(f"Knowledge table now has {count} chunks")
+    return f"Done ({count} chunks)"
 
 
 @get("/query")
-async def query(query: str) -> str:
-    actual = table.search(query).limit(1).to_pydantic(Knowledge)[0]
-    return actual.text
+async def query(q: str) -> str:
+    results = handshake.search(query=q, limit=5)
+    for result in results:
+        print(result["score"], result["text"])
+    return "Done"
 
 
 @get("/test")
-async def test(query: str) -> str:
+async def test(q: str) -> str:
+    model = handshake.embedding_model
     table = db.create_table("test", schema=Knowledge, mode="overwrite")
     table.add(
         [
-            {"text": "hello world"},
-            {"text": "goodbye world"},
+            {"text": "hello world", "vector": model.embed("hello world").tolist()},
+            {"text": "goodbye world", "vector": model.embed("goodbye world").tolist()},
         ]
     )
-    actual = table.search(query).limit(1).to_pydantic(Knowledge)[0]
+    actual = table.search(model.embed(q).tolist()).limit(1).to_pydantic(Knowledge)[0]
     return actual.text
 
 
