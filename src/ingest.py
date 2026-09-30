@@ -1,5 +1,9 @@
 import asyncio
 import json
+import os
+
+os.environ.setdefault("HF_HUB_OFFLINE", "1")  # models are cached; proxy stalls 90s/reload otherwise
+
 import lancedb
 from chonkie import LanceDBHandshake
 from chonkie.pipeline import Pipeline
