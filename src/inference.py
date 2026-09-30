@@ -6,6 +6,7 @@ import re
 
 from openai import AsyncOpenAI
 from litestar import get
+from mlflow.entities import SpanType
 
 from ingest import search
 
@@ -132,26 +133,7 @@ async def infer(q: str) -> str:
 
         messages.append(msg.model_dump(exclude_none=True))
         for name, raw_args, call_id in calls:
-            fn = TOOL_FUNCTIONS.get(name)
-            try:
-                args = json.loads(raw_args) if fn else {}
-                if fn and isinstance(args, dict):
-                    # nemotron sometimes emits empty/extra args; keep valid ones,
-                    # default q to the user's question
-                    valid = inspect.signature(fn).parameters
-                    args = {k: v for k, v in args.items() if k in valid}
-                    args.setdefault("q", q)
-                result = (
-                    await asyncio.to_thread(fn, **args)
-                    if fn
-                    else {"error": f"unknown function: {name}"}
-                )
-            except (json.JSONDecodeError, TypeError, ValueError) as e:
-                result = {"error": str(e)}
-            if isinstance(result, list):  # drop embedding vectors — noise for the LLM
-                result = [
-                    {k: v for k, v in row.items() if k != "vector"} for row in result
-                ]
+            result = await _execute_tool(name, raw_args, q)
             messages.append(
                 {
                     "role": "tool",
