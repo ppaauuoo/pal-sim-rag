@@ -222,4 +222,4 @@ __marimo__/
 .lancedb
 knowledge_base
 mlartifacts
-mlflow.db
+*.db
