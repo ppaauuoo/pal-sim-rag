@@ -1,0 +1,2 @@
+
+uvx mlflow server

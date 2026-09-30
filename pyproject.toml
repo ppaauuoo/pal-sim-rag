@@ -11,6 +11,7 @@ dependencies = [
     "chonkie[lancedb,model2vec]>=1.7.0",
     "lancedb>=0.39.0",
     "litestar>=2.24.0",
+    "mlflow>=3.16.1",
     "ollama>=0.6.3",
     "openai>=3.22.1",
     "pathspec>=1.1.1",

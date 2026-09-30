@@ -8,6 +8,12 @@ from litestar import get
 
 from ingest import search
 
+import mlflow
+
+mlflow.set_tracking_uri("http://localhost:5000")
+mlflow.set_experiment("pal-sim-rag")
+mlflow.openai.autolog()
+
 # ollama serves the OpenAI-compatible API on 11434; override with LLM_BASE_URL
 client = AsyncOpenAI(
     base_url=os.environ.get("LLM_BASE_URL", "http://localhost:11434/v1"),
@@ -55,14 +61,42 @@ async def infer(q: str) -> str:
         tools=tools,
         tool_choice="auto",
     )
-    msg = response.choices[0].message
 
-    if msg.tool_calls:
-        messages.append(msg.model_dump(exclude_none=True))
-        for call in msg.tool_calls:
-            fn = TOOL_FUNCTIONS.get(call.function.name)
+    # ponytail: loop until the model answers without calling tools (max 3 rounds)
+    for _ in range(3):
+        msg = response.choices[0].message
+
+        # collect tool calls; nemotron sometimes emits them as plain JSON content
+        calls = [
+            (c.function.name, c.function.arguments, c.id)
+            for c in (msg.tool_calls or [])
+        ]
+        if not calls and msg.content:
             try:
-                args = json.loads(call.function.arguments) if fn else {}
+                text = (
+                    msg.content.strip()
+                    .removeprefix("```json")
+                    .removesuffix("```")
+                    .strip()
+                )
+                parsed = json.loads(text)
+                if isinstance(parsed, dict) and any(
+                    k in parsed for k in ("query", "q", "name")
+                ):
+                    if "query" in parsed and "q" not in parsed:
+                        parsed["q"] = parsed.pop("query")
+                    calls = [(parsed.get("name", "query"), json.dumps(parsed), "call_0")]
+            except json.JSONDecodeError:
+                pass
+
+        if not calls:
+            break
+
+        messages.append(msg.model_dump(exclude_none=True))
+        for name, raw_args, call_id in calls:
+            fn = TOOL_FUNCTIONS.get(name)
+            try:
+                args = json.loads(raw_args) if fn else {}
                 if fn and isinstance(args, dict):
                     # nemotron sometimes emits empty/extra args; keep valid ones,
                     # default q to the user's question
@@ -72,20 +106,21 @@ async def infer(q: str) -> str:
                 result = (
                     await asyncio.to_thread(fn, **args)
                     if fn
-                    else {"error": f"unknown function: {call.function.name}"}
+                    else {"error": f"unknown function: {name}"}
                 )
             except (json.JSONDecodeError, TypeError, ValueError) as e:
                 result = {"error": str(e)}
             if isinstance(result, list):  # drop embedding vectors — noise for the LLM
-                result = [{k: v for k, v in row.items() if k != "vector"} for row in result]
+                result = [
+                    {k: v for k, v in row.items() if k != "vector"} for row in result
+                ]
             messages.append(
                 {
                     "role": "tool",
-                    "tool_call_id": call.id,
+                    "tool_call_id": call_id,
                     "content": json.dumps(result, default=str),
                 }
             )
         response = await client.chat.completions.create(model=model, messages=messages)
-        msg = response.choices[0].message
 
     return msg.content or ""
