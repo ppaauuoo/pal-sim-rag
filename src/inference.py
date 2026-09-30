@@ -1,12 +1,14 @@
 import asyncio
-import inspect
-import json
 import os
-import re
+import sqlite3
 
-from openai import AsyncOpenAI
 from litestar import get
 from mlflow.entities import SpanType
+from pydantic_ai import Agent, ModelMessagesTypeAdapter
+from pydantic_ai.capabilities import ProcessHistory
+from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.providers.openai import OpenAIProvider
+from pydantic_core import to_json
 
 from ingest import search
 
@@ -14,150 +16,81 @@ import mlflow
 
 mlflow.set_tracking_uri("http://localhost:5000")
 mlflow.set_experiment("pal-sim-rag")
-mlflow.openai.autolog()
+mlflow.pydantic_ai.autolog()
 
 # ollama serves the OpenAI-compatible API on 11434; override with LLM_BASE_URL
-client = AsyncOpenAI(
-    base_url=os.environ.get("LLM_BASE_URL", "http://localhost:11434/v1"),
-    api_key="dummy",
+model = OpenAIChatModel(
+    os.environ.get("LLM_MODEL", "nemotron-3-nano:4b"),
+    provider=OpenAIProvider(
+        base_url=os.environ.get("LLM_BASE_URL", "http://localhost:11434/v1"),
+        api_key="dummy",
+    ),
 )
 
-TOOL_FUNCTIONS = {"query": search}
 
-tools = [
-    {
-        "type": "function",
-        "function": {
-            "name": "query",
-            "description": "Search the ingested knowledge base (Obsidian vault) for relevant notes",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "q": {"type": "string", "description": "Search query"},
-                },
-                "required": ["q"],
-            },
-        },
-    },
-]
-
-_model_id: str | None = None
-
-# nemotron leaks tool calls as content in several shapes: JSON dicts and
-# <function=name><parameter=k>v</parameter></function> blocks
-_FUNC_RE = re.compile(r"<function=(\w+)>(.*?)</function>", re.S)
-_PARAM_RE = re.compile(r"<parameter=(\w+)>\s*(.*?)\s*</parameter>", re.S)
+def _search(q: str) -> list[dict]:
+    """Search the ingested knowledge base (Obsidian vault) for relevant notes."""
+    rows = search(q)
+    return [{k: v for k, v in row.items() if k != "vector"} for row in rows]
 
 
-def _parse_content_tool_calls(content: str, fallback_q: str) -> list[tuple]:
-    """Extract tool calls the model emitted as plain text instead of tool_calls."""
-    calls: list[tuple[str, str, str]] = []
-    text = content.strip().removeprefix("```json").removesuffix("```").strip()
-    for i, match in enumerate(_FUNC_RE.finditer(text)):
-        params = {m.group(1): m.group(2) for m in _PARAM_RE.finditer(match.group(2))}
-        calls.append((match.group(1), json.dumps(params), f"call_{i}"))
-    if calls:
-        return calls
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        return []
-    if isinstance(parsed, dict) and any(k in parsed for k in ("query", "q", "name")):
-        if "query" in parsed and "q" not in parsed:
-            parsed["q"] = parsed.pop("query")
-        return [(parsed.get("name", "query"), json.dumps(parsed), "call_0")]
-    return []
+def _trim(messages: list, limit: int = 20) -> list:
+    """Keep the last `limit` messages, cut at the oldest user prompt so we
+    never split a tool-call/response pair (server would reject that)."""
+    if len(messages) <= limit:
+        return messages
+    cut = len(messages) - limit
+    while cut < len(messages):
+        m = messages[cut]
+        if m.kind == "request" and any(
+            p.part_kind == "user-prompt" for p in m.parts
+        ):
+            break
+        cut += 1
+    return messages[cut:]
 
 
-async def _model() -> str:
-    """Resolve the model id lazily so a down LLM server doesn't kill app import."""
-    global _model_id
-    if _model_id is None:
-        _model_id = os.environ.get("LLM_MODEL", "nemotron-3-nano:4b")
-    return _model_id
+agent = Agent(
+    model,
+    instructions=(
+        "Always call the query tool to search the knowledge base before "
+        "answering. Never answer from memory. If the search results don't "
+        "contain the answer, say the information is not in the knowledge "
+        "base — do not guess."
+    ),
+    tools=[_search],
+    capabilities=[ProcessHistory(_trim)],
+)
+
+# ponytail: one sqlite file, one connection; per-session history via
+# ModelMessagesTypeAdapter. Swap for a real DB if this ever leaves localhost.
+_db = sqlite3.connect("history.db", check_same_thread=False)
+_db.execute(
+    "CREATE TABLE IF NOT EXISTS history ("
+    "session_id TEXT PRIMARY KEY, messages TEXT NOT NULL)"
+)
 
 
-async def _execute_tool(name: str, raw_args: str, fallback_q: str):
-    """Run a tool call; traced as a TOOL span even when the model leaked the call as content."""
-    with mlflow.start_span(name=f"tool:{name}", span_type=SpanType.TOOL) as span:
-        fn = TOOL_FUNCTIONS.get(name)
-        try:
-            args = json.loads(raw_args) if fn else {}
-            if fn and isinstance(args, dict):
-                # nemotron sometimes emits empty/extra args; keep valid ones,
-                # default q to the user's question
-                valid = inspect.signature(fn).parameters
-                args = {k: v for k, v in args.items() if k in valid}
-                args.setdefault("q", fallback_q)
-            span.set_inputs({"name": name, "args": args})
-            result = (
-                await asyncio.to_thread(fn, **args)
-                if fn
-                else {"error": f"unknown function: {name}"}
-            )
-        except (json.JSONDecodeError, TypeError, ValueError) as e:
-            result = {"error": str(e)}
-        if isinstance(result, list):  # drop embedding vectors — noise for the LLM
-            result = [{k: v for k, v in row.items() if k != "vector"} for row in result]
-        span.set_outputs({"results": result})
-        return result
+def _load_history(session_id: str) -> list:
+    row = _db.execute(
+        "SELECT messages FROM history WHERE session_id = ?", (session_id,)
+    ).fetchone()
+    return ModelMessagesTypeAdapter.validate_json(row[0]) if row else []
+
+
+def _save_history(session_id: str, messages: list) -> None:
+    _db.execute(
+        "INSERT INTO history (session_id, messages) VALUES (?, ?) "
+        "ON CONFLICT(session_id) DO UPDATE SET messages = excluded.messages",
+        (session_id, to_json(_trim(messages)).decode()),
+    )
+    _db.commit()
 
 
 @get("/infer")
 @mlflow.trace(name="infer", span_type=SpanType.CHAIN)
-async def infer(q: str) -> str:
-    model = await _model()
-    messages: list = [
-        {
-            "role": "system",
-            "content": "Always call the query tool to search the knowledge base before answering. Never answer from memory. If the search results don't contain the answer, say the information is not in the knowledge base — do not guess.",
-        },
-        {"role": "user", "content": q},
-    ]
-
-    response = await client.chat.completions.create(
-        model=model,
-        messages=messages,
-        tools=tools,
-        tool_choice="auto",
-    )
-
-    # ponytail: loop until the model answers without calling tools (max 3 rounds)
-    for _ in range(3):
-        msg = response.choices[0].message
-
-        # collect tool calls; nemotron sometimes emits them as plain JSON content
-        calls = [
-            (c.function.name, c.function.arguments, c.id)
-            for c in (msg.tool_calls or [])
-        ]
-        if not calls and msg.content:
-            calls = _parse_content_tool_calls(msg.content, q)
-
-        if not calls:
-            break
-
-        messages.append(msg.model_dump(exclude_none=True))
-        for name, raw_args, call_id in calls:
-            result = await _execute_tool(name, raw_args, q)
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": call_id,
-                    "content": json.dumps(result, default=str),
-                }
-            )
-        response = await client.chat.completions.create(model=model, messages=messages)
-
-    # ponytail: model burned all rounds on tool calls — force a final answer
-    if not (msg.content or "").strip():
-        messages.append(
-            {
-                "role": "user",
-                "content": "Answer the original question now using the search results above. Do not call tools.",
-            }
-        )
-        response = await client.chat.completions.create(model=model, messages=messages)
-        msg = response.choices[0].message
-
-    return msg.content or ""
+async def infer(q: str, session_id: str = "default") -> str:
+    history = await asyncio.to_thread(_load_history, session_id)
+    result = await agent.run(q, message_history=history)
+    await asyncio.to_thread(_save_history, session_id, result.all_messages())
+    return result.output

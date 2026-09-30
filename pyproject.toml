@@ -15,6 +15,7 @@ dependencies = [
     "ollama>=0.6.3",
     "openai>=3.22.1",
     "pathspec>=1.1.1",
+    "pydantic-ai>=2.52.0",
     "sentence-transformers>=6.1.0",
     "torch>=2.14.0",
     "uvicorn>=0.54.0",
