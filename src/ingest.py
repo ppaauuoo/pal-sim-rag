@@ -1,14 +1,13 @@
+import json
 import lancedb
-import uvicorn
 from chonkie import LanceDBHandshake
 from chonkie.pipeline import Pipeline
 from lancedb.pydantic import LanceModel, Vector
 from lancedb.rerankers import CrossEncoderReranker
-from litestar import Litestar, get
-from litestar.openapi import OpenAPIConfig
+from litestar import get
 from pathlib import Path
 
-from fetch import VaultFetcher
+# from fetch import VaultFetcher
 
 EMBEDDING_MODEL = "model2vec://mikeee/m2v-gemma-embedding-300m"
 RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
@@ -29,11 +28,6 @@ class Knowledge(LanceModel):
     vector: Vector(handshake.dimension)
 
 
-@get("/")
-async def index() -> str:
-    return "Hello, world!"
-
-
 @get("/ingests")
 async def ingests() -> str:
     handshake.table.delete("true")  ## reset knowledge
@@ -51,23 +45,36 @@ async def ingests() -> str:
         )
         .run()
     )
-    count = db.open_table(
-        "knowledge"
-    ).count_rows()  # fresh open: handle snapshots go stale
+    tbl = db.open_table("knowledge")  # fresh open: handle snapshots go stale
+    tbl.create_fts_index("text", replace=True)  # required for hybrid /query
+    count = tbl.count_rows()
     print(f"Knowledge table now has {count} chunks")
     return f"Done ({count} chunks)"
 
 
 @get("/query")
-async def query(q: str) -> list[dict[str, str]]:
-    # handshake.table = db.open_table("knowledge")
-    # results = handshake.search(query=q, limit=5)
-    # for result in results:
-    #     print(result["score"], result["text"])
-
+async def query(q: str) -> list[dict]:
     tbl = db.open_table("knowledge")
-    results = tbl.search(q, query_type="hybrid").rerank(reranker=reranker).to_pandas()
-
+    if "text_idx" not in {
+        i.name for i in tbl.list_indices()
+    }:  # lazy FTS for pre-index tables
+        tbl.create_fts_index("text")
+    vector = handshake.embedding_model.embed(q).tolist()
+    results = (
+        tbl.search(query_type="hybrid")
+        .text(q)
+        .vector(vector)
+        .rerank(reranker=reranker)
+        .limit(5)
+        .to_list()
+    )
+    for row in results:  # unpack chunk_metadata JSON so filename etc. are top-level
+        meta = row.pop("chunk_metadata", None)
+        if meta:
+            try:
+                row.update(json.loads(meta))
+            except json.JSONDecodeError:
+                pass
     return results
 
 
@@ -83,14 +90,3 @@ async def test(q: str) -> str:
     )
     actual = table.search(model.embed(q).tolist()).limit(1).to_pydantic(Knowledge)[0]
     return actual.text
-
-
-app = Litestar(
-    [index, ingests, query, test],
-    openapi_config=OpenAPIConfig(title="My API", version="1.0.0"),
-)
-
-
-def main():
-    # This fires up Uvicorn and hands it your app instance
-    uvicorn.run(app, host="127.0.0.1", port=8000)
