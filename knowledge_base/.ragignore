@@ -1,0 +1,14 @@
+# Gitignore-style rules for what /ingests should skip.
+# Patterns match relative to this folder (knowledge_base/). Lines starting with # are comments.
+# Examples (remove the leading # to activate):
+# attachments/
+# daily/*.md
+# secret.md
+# *.canvas
+Attachments
+Categories
+Clippings
+Daily
+References
+Templates
+LICENSE
