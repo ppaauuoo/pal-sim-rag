@@ -110,7 +110,7 @@ async def infer(q: str) -> str:
     messages: list = [
         {
             "role": "system",
-            "content": "Always call the query tool to search the knowledge base before answering. Never answer from memory.",
+            "content": "Always call the query tool to search the knowledge base before answering. Never answer from memory. If the search results don't contain the answer, say the information is not in the knowledge base — do not guess.",
         },
         {"role": "user", "content": q},
     ]

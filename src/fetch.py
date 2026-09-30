@@ -65,7 +65,7 @@ class VaultFetcher(BaseFetcher):
                     continue
                 path = Path(root) / filename
                 if filename.lower().endswith(".lnk"):
-                    target = _resolve_lnk(path)
+                    target = self._resolve_lnk(path)
                     if target is None:
                         continue
                     if target.is_dir():

@@ -12,7 +12,7 @@ from lancedb.rerankers import CrossEncoderReranker
 from litestar import get
 from pathlib import Path
 
-# from fetch import VaultFetcher
+from fetch import VaultFetcher  # noqa: F401 — registers the "vault" fetcher alias
 
 EMBEDDING_MODEL = "model2vec://mikeee/m2v-gemma-embedding-300m"
 RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
@@ -40,8 +40,10 @@ async def ingests() -> str:
         Pipeline()
         .fetch_from("vault", dir=str(ROOT / "knowledge_base"), ext=[".md", ".txt"])
         .process_with("text")
-        .chunk_with("semantic", threshold=0.8, chunk_size=1024, similarity_window=3)
-        .refine_with("overlap", context_size=100)
+        .chunk_with("recursive", chunk_size=512, min_characters_per_chunk=24)
+        # ponytail: semantic chunking fragmented bullet-list notes into 10-token
+        # heading-only chunks; recursive keeps sections intact. Revisit if notes
+        # become long-form prose.
         .store_in(
             "lancedb",
             connection=db,
@@ -80,7 +82,9 @@ def search(q: str) -> list[dict]:
                 row.update(json.loads(meta))
             except json.JSONDecodeError:
                 pass
-    return results
+    # ponytail: cross-encoder scores are bimodal (relevant ≥0.5, junk <0.02);
+    # floor at 0.3 so unrelated chunks never reach the LLM. Raise if junk leaks.
+    return [r for r in results if r.get("_relevance_score", 0) >= 0.3]
 
 
 @get("/query")
