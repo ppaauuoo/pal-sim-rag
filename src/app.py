@@ -18,4 +18,4 @@ app = Litestar(
 
 def main():
     # This fires up Uvicorn and hands it your app instance
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8123)
