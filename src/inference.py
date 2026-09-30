@@ -107,7 +107,13 @@ async def _execute_tool(name: str, raw_args: str, fallback_q: str):
 @mlflow.trace(name="infer", span_type=SpanType.CHAIN)
 async def infer(q: str) -> str:
     model = await _model()
-    messages: list = [{"role": "user", "content": q}]
+    messages: list = [
+        {
+            "role": "system",
+            "content": "Always call the query tool to search the knowledge base before answering. Never answer from memory.",
+        },
+        {"role": "user", "content": q},
+    ]
 
     response = await client.chat.completions.create(
         model=model,
