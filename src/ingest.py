@@ -1,3 +1,4 @@
+import asyncio
 import json
 import lancedb
 from chonkie import LanceDBHandshake
@@ -52,8 +53,8 @@ async def ingests() -> str:
     return f"Done ({count} chunks)"
 
 
-@get("/query")
-async def query(q: str) -> list[dict]:
+def search(q: str) -> list[dict]:
+    """Plain hybrid search — used by /query and as the LLM tool in inference.py."""
     tbl = db.open_table("knowledge")
     if "text_idx" not in {
         i.name for i in tbl.list_indices()
@@ -76,6 +77,11 @@ async def query(q: str) -> list[dict]:
             except json.JSONDecodeError:
                 pass
     return results
+
+
+@get("/query")
+async def query(q: str) -> list[dict]:
+    return await asyncio.to_thread(search, q)
 
 
 @get("/test")

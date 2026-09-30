@@ -1,22 +1,31 @@
-from openai import OpenAI
-from ingest import query
-from litestar import get
+import asyncio
+import inspect
 import json
+import os
 
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="dummy")
+from openai import AsyncOpenAI
+from litestar import get
 
-tool_functions = {"query": query}
+from ingest import search
+
+# ollama serves the OpenAI-compatible API on 11434; override with LLM_BASE_URL
+client = AsyncOpenAI(
+    base_url=os.environ.get("LLM_BASE_URL", "http://localhost:11434/v1"),
+    api_key="dummy",
+)
+
+TOOL_FUNCTIONS = {"query": search}
 
 tools = [
     {
         "type": "function",
         "function": {
             "name": "query",
-            "description": "Get knowledge",
+            "description": "Search the ingested knowledge base (Obsidian vault) for relevant notes",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "q": {"type": "string", "description": "Query for knowledge"},
+                    "q": {"type": "string", "description": "Search query"},
                 },
                 "required": ["q"],
             },
@@ -24,20 +33,59 @@ tools = [
     },
 ]
 
+_model_id: str | None = None
+
+
+async def _model() -> str:
+    """Resolve the model id lazily so a down LLM server doesn't kill app import."""
+    global _model_id
+    if _model_id is None:
+        _model_id = os.environ.get("LLM_MODEL", "nemotron-3-nano:4b")
+    return _model_id
+
 
 @get("/infer")
-def infer(q: str):
-    response = client.chat.completions.create(
-        model=client.models.list().data[0].id,
-        messages=[{"role": "user", "content": q}],
+async def infer(q: str) -> str:
+    model = await _model()
+    messages: list = [{"role": "user", "content": q}]
+
+    response = await client.chat.completions.create(
+        model=model,
+        messages=messages,
         tools=tools,
         tool_choice="auto",
     )
+    msg = response.choices[0].message
 
-    tool_call = response.choices[0].message.tool_calls[0].function
-    print(f"Function called: {tool_call.name}")
-    print(f"Arguments: {tool_call.arguments}")
-    print(
-        f"Result: {tool_functions[tool_call.name](**json.loads(tool_call.arguments))}"
-    )
-    return response
+    if msg.tool_calls:
+        messages.append(msg.model_dump(exclude_none=True))
+        for call in msg.tool_calls:
+            fn = TOOL_FUNCTIONS.get(call.function.name)
+            try:
+                args = json.loads(call.function.arguments) if fn else {}
+                if fn and isinstance(args, dict):
+                    # nemotron sometimes emits empty/extra args; keep valid ones,
+                    # default q to the user's question
+                    valid = inspect.signature(fn).parameters
+                    args = {k: v for k, v in args.items() if k in valid}
+                    args.setdefault("q", q)
+                result = (
+                    await asyncio.to_thread(fn, **args)
+                    if fn
+                    else {"error": f"unknown function: {call.function.name}"}
+                )
+            except (json.JSONDecodeError, TypeError, ValueError) as e:
+                result = {"error": str(e)}
+            if isinstance(result, list):  # drop embedding vectors — noise for the LLM
+                result = [{k: v for k, v in row.items() if k != "vector"} for row in result]
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": json.dumps(result, default=str),
+                }
+            )
+        response = await client.chat.completions.create(model=model, messages=messages)
+        msg = response.choices[0].message
+
+    return msg.content or ""
