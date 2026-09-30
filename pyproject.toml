@@ -1,0 +1,23 @@
+[project]
+name = "simple-local-rag"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Vorakan S", email = "vorakan.sumethsenee@wdc.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "chonkie[lancedb]>=1.7.0",
+    "lancedb>=0.39.0",
+    "litestar>=2.24.0",
+    "ollama>=0.6.3",
+    "uvicorn>=0.54.0",
+]
+
+[project.scripts]
+ingest-api = "ingest:main"
+
+[build-system]
+requires = ["uv_build>=0.12.6,<0.13.0"]
+build-backend = "uv_build"
