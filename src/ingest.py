@@ -53,7 +53,7 @@ async def ingests() -> str:
         .run()
     )
     tbl = db.open_table("knowledge")  # fresh open: handle snapshots go stale
-    tbl.create_fts_index("text", replace=True)  # required for hybrid /query
+    tbl.create_fts_index("text", replace=True, with_position=True)  # required for hybrid /query; positions needed for phrase queries
     count = tbl.count_rows()
     print(f"Knowledge table now has {count} chunks")
     return f"Done ({count} chunks)"
@@ -65,14 +65,14 @@ def search(q: str) -> list[dict]:
     if "text_idx" not in {
         i.name for i in tbl.list_indices()
     }:  # lazy FTS for pre-index tables
-        tbl.create_fts_index("text")
+        tbl.create_fts_index("text", with_position=True)
     vector = handshake.embedding_model.embed(q).tolist()
     results = (
         tbl.search(query_type="hybrid")
         .text(q)
         .vector(vector)
         .rerank(reranker=reranker)
-        .limit(5)
+        .limit(20)
         .to_list()
     )
     for row in results:  # unpack chunk_metadata JSON so filename etc. are top-level
